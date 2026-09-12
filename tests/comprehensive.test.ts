@@ -493,3 +493,128 @@ test('Comprehensive EXPLORER: note search, editing, deletion, tag manager & doct
 
   db.close();
 });
+
+test('Favorites MERGE: unifies Type = 0 system tags, deduplicates publications in TagMap, and self-heals duplicate tags', async () => {
+  const dbA = await openDatabase();
+  createBaseSchema(dbA);
+  // Base A: French device with "Favoris"
+  execute(dbA, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (1, 'nwtsty', 1, 'Bible')`);
+  execute(dbA, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (2, 'es26', 1, 'Daily Text')`);
+  execute(dbA, `INSERT INTO Tag (TagId, Type, Name) VALUES (1, 0, 'Favoris')`);
+  execute(dbA, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (1, 1, 1, 0)`);
+  execute(dbA, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (2, 2, 1, 1)`);
+
+  const primaryBytes = exportDatabase(dbA);
+  dbA.close();
+
+  const dbB = await openDatabase();
+  createBaseSchema(dbB);
+  // Base B: English device with "Favorites", same Bible publication and a new Songbook publication
+  execute(dbB, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (10, 'nwtsty', 1, 'Bible')`);
+  execute(dbB, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (20, 'sjj', 1, 'Songs')`);
+  execute(dbB, `INSERT INTO Tag (TagId, Type, Name) VALUES (1, 0, 'Favorites')`);
+  execute(dbB, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (1, 10, 1, 0)`);
+  execute(dbB, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (2, 20, 1, 1)`);
+
+  const secBytes = exportDatabase(dbB);
+  dbB.close();
+
+  const dummyManifest: IManifest = {
+    name: 'test',
+    creationDate: new Date().toISOString(),
+    version: 1,
+    type: 0,
+    userDataBackup: {
+      lastModifiedDate: new Date().toISOString(),
+      deviceName: 'Device',
+      databaseName: 'userData.db',
+      schemaVersion: 1,
+    },
+  };
+
+  const mergeResult = await mergeJwLibraries(primaryBytes, dummyManifest, [
+    { name: 'Secondary', dbBytes: secBytes, manifest: dummyManifest },
+  ]);
+
+  const mergedDb = await openDatabase(mergeResult.mergedDbBytes);
+
+  // 1. Verify exactly 1 Favorite tag (Type = 0)
+  const favTags = queryAll<any>(mergedDb, 'SELECT * FROM Tag WHERE Type = 0');
+  assert.equal(favTags.length, 1, 'There must be exactly ONE system favorite tag of Type 0');
+  assert.equal(favTags[0].Name, 'Favoris');
+
+  // 2. Verify TagMap has no duplicate publications (Bible should be listed once, not twice)
+  const tagMaps = queryAll<any>(mergedDb, 'SELECT * FROM TagMap WHERE TagId = :tid ORDER BY Position ASC', { ':tid': favTags[0].TagId });
+  assert.equal(tagMaps.length, 3, 'TagMap should contain 3 items (Bible, Daily Text, Songs)');
+  
+  // Verify distinct locations in TagMap
+  const locIds = tagMaps.map((tm: any) => tm.LocationId);
+  const uniqueLocIds = new Set(locIds);
+  assert.equal(locIds.length, uniqueLocIds.size, 'Each publication must be mapped at most once to favorites');
+
+  mergedDb.close();
+});
+
+test('Bookmarks MERGE: deduplicates bookmarks on same passage across differing slots, and respects 0..9 slot boundary', async () => {
+  const dbA = await openDatabase();
+  createBaseSchema(dbA);
+  execute(dbA, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (1, 'nwtsty', 1, 'Bible')`);
+  execute(dbA, `INSERT INTO Location (LocationId, KeySymbol, BookNumber, ChapterNumber, Type, Title) VALUES (2, 'nwtsty', 1, 1, 0, 'Genesis 1')`);
+  // Primary has Genesis 1 on Slot 0
+  execute(dbA, `INSERT INTO Bookmark (BookmarkId, LocationId, PublicationLocationId, Slot, Title, BlockType, BlockIdentifier)
+                VALUES (1, 2, 1, 0, 'Genèse 1', 0, NULL)`);
+
+  const primaryBytes = exportDatabase(dbA);
+  dbA.close();
+
+  const dbB = await openDatabase();
+  createBaseSchema(dbB);
+  execute(dbB, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (10, 'nwtsty', 1, 'Bible')`);
+  execute(dbB, `INSERT INTO Location (LocationId, KeySymbol, BookNumber, ChapterNumber, Type, Title) VALUES (20, 'nwtsty', 1, 1, 0, 'Genesis 1')`);
+  execute(dbB, `INSERT INTO Location (LocationId, KeySymbol, BookNumber, ChapterNumber, Type, Title) VALUES (21, 'nwtsty', 1, 2, 0, 'Genesis 2')`);
+  // Secondary has same Genesis 1 but on Slot 3, plus Genesis 2 on Slot 0
+  execute(dbB, `INSERT INTO Bookmark (BookmarkId, LocationId, PublicationLocationId, Slot, Title, BlockType, BlockIdentifier)
+                VALUES (1, 20, 10, 3, 'Genèse 1', 0, NULL)`);
+  execute(dbB, `INSERT INTO Bookmark (BookmarkId, LocationId, PublicationLocationId, Slot, Title, BlockType, BlockIdentifier)
+                VALUES (2, 21, 10, 0, 'Genèse 2', 0, NULL)`);
+
+  const secBytes = exportDatabase(dbB);
+  dbB.close();
+
+  const dummyManifest: IManifest = {
+    name: 'test',
+    creationDate: new Date().toISOString(),
+    version: 1,
+    type: 0,
+    userDataBackup: {
+      lastModifiedDate: new Date().toISOString(),
+      deviceName: 'Device',
+      databaseName: 'userData.db',
+      schemaVersion: 1,
+    },
+  };
+
+  const mergeResult = await mergeJwLibraries(primaryBytes, dummyManifest, [
+    { name: 'Secondary', dbBytes: secBytes, manifest: dummyManifest },
+  ]);
+
+  const mergedDb = await openDatabase(mergeResult.mergedDbBytes);
+
+  // 1. Genesis 1 must exist exactly ONCE (no duplicate on slot 3 or shifted slot)
+  const bms = queryAll<any>(mergedDb, 'SELECT * FROM Bookmark ORDER BY Slot ASC');
+  assert.equal(bms.length, 2, 'There should be exactly 2 bookmarks (Genesis 1 and Genesis 2)');
+
+  // Slot 0 is Genesis 1, Genesis 2 takes next available slot (slot 1)
+  assert.equal(bms[0].Slot, 0);
+  assert.equal(bms[0].Title, 'Genèse 1');
+  assert.equal(bms[1].Slot, 1);
+  assert.equal(bms[1].Title, 'Genèse 2');
+
+  // Verify all slots are within [0..9]
+  for (const bm of bms) {
+    assert.ok(bm.Slot >= 0 && bm.Slot < 10, `Slot ${bm.Slot} must be within 0..9 for JW Library compatibility`);
+  }
+
+  mergedDb.close();
+});
+
