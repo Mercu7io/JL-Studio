@@ -196,7 +196,7 @@ export async function packageJwLibrary(
   return await zip.generateAsync(
     {
       type: 'blob',
-      mimeType: 'application/zip',
+      mimeType: 'application/octet-stream',
       compression: 'DEFLATE',
       compressionOptions: { level: 6 },
     },

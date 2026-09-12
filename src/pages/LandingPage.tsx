@@ -621,7 +621,10 @@ export const LandingPage: React.FC = () => {
 
   const handleDownload = () => {
     if (!mergeResult) return;
-    const url = URL.createObjectURL(mergeResult.mergedBlob);
+    const downloadBlob = mergeResult.mergedBlob.type === 'application/octet-stream'
+      ? mergeResult.mergedBlob
+      : new Blob([mergeResult.mergedBlob], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(downloadBlob);
     const a = document.createElement('a');
     a.href = url;
     a.download = outputName.endsWith('.jwlibrary') ? outputName : `${outputName}.jwlibrary`;

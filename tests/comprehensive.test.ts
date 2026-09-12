@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { openDatabase, execute, queryAll, queryOne, exportDatabase, getLibrarySummary } from '../src/lib/jw/sqlite.ts';
 import { mergeJwLibraries } from '../src/lib/jw/merge.ts';
 import { runHealthChecks, applyHealthFix } from '../src/lib/jw/doctor.ts';
+import { packageJwLibrary } from '../src/lib/jw/zip.ts';
 import type { IManifest } from '../src/lib/jw/types.ts';
 
 function createBaseSchema(db: any) {
@@ -617,4 +618,69 @@ test('Bookmarks MERGE: deduplicates bookmarks on same passage across differing s
 
   mergedDb.close();
 });
+
+test('Doctor health check: detects and repairs duplicate favorite tags & duplicate favorite publications in TagMap', async () => {
+  const db = await openDatabase();
+  createBaseSchema(db);
+
+  // Setup database in corrupted state: 2 Type 0 tags ("Favoris" and "Favorites"), and duplicate publication in TagMap
+  execute(db, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (1, 'nwtsty', 1, 'Bible')`);
+  execute(db, `INSERT INTO Location (LocationId, KeySymbol, Type, Title) VALUES (2, 'es26', 1, 'Daily Text')`);
+
+  execute(db, `INSERT INTO Tag (TagId, Type, Name) VALUES (1, 0, 'Favoris')`);
+  execute(db, `INSERT INTO Tag (TagId, Type, Name) VALUES (2, 0, 'Favorites')`);
+
+  // Location 1 is mapped to Tag 1 AND Tag 2
+  execute(db, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (1, 1, 1, 0)`);
+  execute(db, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (2, 1, 2, 0)`);
+  // Location 2 is mapped to Tag 1 twice (duplicate publication)
+  execute(db, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (3, 2, 1, 1)`);
+  execute(db, `INSERT INTO TagMap (TagMapId, LocationId, TagId, Position) VALUES (4, 2, 1, 2)`);
+
+  // 1. Doctor must detect dup_fav_tags
+  const issues = runHealthChecks(db);
+  const favIssue = issues.find((i) => i.key === 'dup_fav_tags');
+  assert.ok(favIssue, 'Doctor must detect duplicate favorite tags and map entries');
+  assert.ok(favIssue.count > 0, `Expected duplicate count > 0, got ${favIssue.count}`);
+
+  // 2. Doctor repairs the issue
+  applyHealthFix(db, 'dup_fav_tags', favIssue.affectedIds);
+
+  // 3. Post-repair verification
+  const postIssues = runHealthChecks(db);
+  const postFavIssue = postIssues.find((i) => i.key === 'dup_fav_tags');
+  assert.equal(postFavIssue, undefined, 'Duplicate favorites issue must be completely resolved');
+
+  const remainingTags = queryAll<any>(db, 'SELECT * FROM Tag WHERE Type = 0');
+  assert.equal(remainingTags.length, 1, 'Must have exactly 1 favorite tag remaining');
+
+  const remainingMaps = queryAll<any>(db, 'SELECT * FROM TagMap WHERE TagId = :tid', { ':tid': remainingTags[0].TagId });
+  assert.equal(remainingMaps.length, 2, 'Must have exactly 2 distinct favorite publications (Bible and Daily Text)');
+
+  db.close();
+});
+
+test('packageJwLibrary MIME type: emits application/octet-stream to prevent mobile browsers appending .zip', async () => {
+  const db = await openDatabase();
+  createBaseSchema(db);
+  const dbBytes = exportDatabase(db);
+  db.close();
+
+  const manifest: IManifest = {
+    name: 'test_backup',
+    creationDate: new Date().toISOString(),
+    version: 1,
+    type: 0,
+    userDataBackup: {
+      lastModifiedDate: new Date().toISOString(),
+      deviceName: 'TestDevice',
+      databaseName: 'userData.db',
+      schemaVersion: 1,
+    },
+  };
+
+  const blob = await packageJwLibrary(dbBytes, manifest);
+  assert.equal(blob.type, 'application/octet-stream', 'Blob MIME type must be application/octet-stream');
+});
+
 
