@@ -224,6 +224,47 @@ export async function mergeJwLibraries(
     const tagMap = new Map<number, number>(); // secTagId -> mainTagId
 
     if (tableExists(secDb, 'Tag') && tableExists(mainDb, 'Tag')) {
+      // Ensure mainDb has at most one system favorite tag (Type = 0)
+      const existingFavTags = queryAll<{ TagId: number }>(
+        mainDb,
+        'SELECT TagId FROM Tag WHERE Type = 0 ORDER BY TagId ASC'
+      );
+      if (existingFavTags.length > 1) {
+        const canonicalFavId = existingFavTags[0].TagId;
+        const duplicateFavIds = existingFavTags.slice(1).map((t) => t.TagId);
+        for (const dupId of duplicateFavIds) {
+          if (tableExists(mainDb, 'TagMap')) {
+            const dupTagMaps = queryAll<ITagMap>(
+              mainDb,
+              'SELECT * FROM TagMap WHERE TagId = :dupId',
+              { ':dupId': dupId }
+            );
+            for (const tm of dupTagMaps) {
+              const alreadyExists = queryOne(
+                mainDb,
+                'SELECT 1 FROM TagMap WHERE TagId = :canon AND LocationId = :loc LIMIT 1',
+                { ':canon': canonicalFavId, ':loc': tm.LocationId }
+              );
+              if (!alreadyExists && tm.LocationId) {
+                const nextPosRow = queryOne<{ nextPos: number }>(
+                  mainDb,
+                  'SELECT COALESCE(MAX(Position), -1) + 1 AS nextPos FROM TagMap WHERE TagId = :tid',
+                  { ':tid': canonicalFavId }
+                );
+                execute(
+                  mainDb,
+                  'UPDATE TagMap SET TagId = :canon, Position = :pos WHERE TagMapId = :tmid',
+                  { ':canon': canonicalFavId, ':pos': nextPosRow?.nextPos ?? 0, ':tmid': tm.TagMapId }
+                );
+              } else {
+                execute(mainDb, 'DELETE FROM TagMap WHERE TagMapId = :tmid', { ':tmid': tm.TagMapId });
+              }
+            }
+          }
+          execute(mainDb, 'DELETE FROM Tag WHERE TagId = :dupId', { ':dupId': dupId });
+        }
+      }
+
       const secTags = queryAll<ITag>(secDb, 'SELECT * FROM Tag');
 
       for (const tag of secTags) {
@@ -240,11 +281,13 @@ export async function mergeJwLibraries(
           }
         }
 
-        const match = queryOne<{ TagId: number }>(
-          mainDb,
-          'SELECT TagId FROM Tag WHERE Name = :name COLLATE NOCASE AND Type = :type LIMIT 1',
-          { ':name': finalTagName, ':type': tag.Type ?? 1 }
-        );
+        const match = tag.Type === 0
+          ? queryOne<{ TagId: number }>(mainDb, 'SELECT TagId FROM Tag WHERE Type = 0 LIMIT 1')
+          : queryOne<{ TagId: number }>(
+              mainDb,
+              'SELECT TagId FROM Tag WHERE Name = :name COLLATE NOCASE AND Type = :type LIMIT 1',
+              { ':name': finalTagName, ':type': tag.Type ?? 1 }
+            );
 
         if (match) {
           tagMap.set(tag.TagId, match.TagId);
@@ -596,37 +639,71 @@ export async function mergeJwLibraries(
 
         if (!mappedLocId || !mappedPubLocId) continue;
 
-        // Check if exact bookmark already exists on same location and slot
-        const exactMatch = queryOne<{ BookmarkId: number }>(
-          mainDb,
-          `SELECT BookmarkId FROM Bookmark 
-           WHERE LocationId = :lid AND PublicationLocationId = :plid AND Slot = :slot`,
-          { ':lid': mappedLocId, ':plid': mappedPubLocId, ':slot': bm.Slot }
-        );
-        if (exactMatch) continue;
-
-        // Check if slot on publication location is already occupied
-        let targetSlot = bm.Slot;
-        const slotTaken = queryOne<{ c: number }>(
-          mainDb,
-          `SELECT COUNT(*) AS c FROM Bookmark WHERE PublicationLocationId = :plid AND Slot = :slot`,
-          { ':plid': mappedPubLocId, ':slot': targetSlot }
-        );
-        if (slotTaken && slotTaken.c > 0) {
-          const nextSlotRow = queryOne<{ nextSlot: number }>(
-            mainDb,
-            `SELECT COALESCE(MAX(Slot), -1) + 1 AS nextSlot FROM Bookmark WHERE PublicationLocationId = :plid`,
-            { ':plid': mappedPubLocId }
-          );
-          targetSlot = nextSlotRow ? nextSlotRow.nextSlot : 0;
-        }
-
         const blockType = bm.BlockType ?? 0;
         const blockId = blockType === 0 ? null : (bm.BlockIdentifier ?? null);
 
         const hasBmBt = columnExists(mainDb, 'Bookmark', 'BlockType');
         const hasBmBi = columnExists(mainDb, 'Bookmark', 'BlockIdentifier');
         const hasBmPub = columnExists(mainDb, 'Bookmark', 'PublicationLocationId');
+
+        // Check if bookmark already exists for the same content in this publication
+        const btClause = hasBmBt ? 'AND IFNULL(BlockType, 0) = :bt' : '';
+        const biClause = hasBmBi ? 'AND IFNULL(BlockIdentifier, -1) = :bi' : '';
+        const pubClause = hasBmPub ? 'AND PublicationLocationId = :plid' : '';
+
+        const sameContentMatch = queryOne<{ BookmarkId: number }>(
+          mainDb,
+          `SELECT BookmarkId FROM Bookmark 
+           WHERE LocationId = :lid 
+             ${pubClause}
+             ${btClause}
+             ${biClause}
+           LIMIT 1`,
+          {
+            ':lid': mappedLocId,
+            ...(hasBmPub ? { ':plid': mappedPubLocId } : {}),
+            ...(hasBmBt ? { ':bt': blockType } : {}),
+            ...(hasBmBi ? { ':bi': blockId ?? -1 } : {}),
+          }
+        );
+        if (sameContentMatch) continue;
+
+        // Resolve slot collision safely within valid range 0..9
+        let targetSlot = bm.Slot;
+        const slotTaken =
+          targetSlot >= 10 ||
+          (queryOne<{ c: number }>(
+            mainDb,
+            `SELECT COUNT(*) AS c FROM Bookmark WHERE ${hasBmPub ? 'PublicationLocationId = :plid' : 'LocationId = :lid'} AND Slot = :slot`,
+            {
+              ...(hasBmPub ? { ':plid': mappedPubLocId } : { ':lid': mappedLocId }),
+              ':slot': targetSlot,
+            }
+          )?.c ?? 0) > 0;
+
+        if (slotTaken) {
+          const occupiedSlots = new Set(
+            queryAll<{ Slot: number }>(
+              mainDb,
+              `SELECT Slot FROM Bookmark WHERE ${hasBmPub ? 'PublicationLocationId = :plid' : 'LocationId = :lid'}`,
+              hasBmPub ? { ':plid': mappedPubLocId } : { ':lid': mappedLocId }
+            ).map((r) => r.Slot)
+          );
+
+          let firstFreeSlot = -1;
+          for (let s = 0; s < 10; s++) {
+            if (!occupiedSlots.has(s)) {
+              firstFreeSlot = s;
+              break;
+            }
+          }
+          if (firstFreeSlot === -1) {
+            // All 10 slots (0-9) are occupied for this publication;
+            // skip to prevent creating slot >= 10 which breaks JW Library restore
+            continue;
+          }
+          targetSlot = firstFreeSlot;
+        }
 
         const bmCols = ['LocationId', 'Slot', 'Title', 'Snippet'];
         const bmVals = [':lid', ':slot', ':title', ':snip'];
