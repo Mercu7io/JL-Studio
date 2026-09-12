@@ -406,7 +406,8 @@ export const ExplorerPage: React.FC = () => {
     if (!activeDb || !activeManifest) return;
     const dbBytes = exportDatabase(activeDb);
     const updatedManifest = await createOrUpdateManifest(dbBytes, activeManifest);
-    const blob = await packageJwLibrary(dbBytes, updatedManifest, extraFiles);
+    const rawBlob = await packageJwLibrary(dbBytes, updatedManifest, extraFiles);
+    const blob = rawBlob.type === 'application/octet-stream' ? rawBlob : new Blob([rawBlob], { type: 'application/octet-stream' });
 
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

@@ -11,7 +11,7 @@
 
 import type { Database } from 'sql.js';
 import type { IHealthCheckResult } from './types.ts';
-import { tableExists, columnExists, queryAll, execute } from './sqlite.ts';
+import { tableExists, columnExists, queryAll, queryOne, execute } from './sqlite.ts';
 
 export function runHealthChecks(db: Database): IHealthCheckResult[] {
   const results: IHealthCheckResult[] = [];
@@ -165,6 +165,78 @@ export function runHealthChecks(db: Database): IHealthCheckResult[] {
     });
   }
 
+  // 7. Duplicate Favorite Tags & Duplicate Favorite Publications
+  if (tableExists(db, 'Tag')) {
+    const favTags = queryAll<{ TagId: number }>(db, 'SELECT TagId FROM Tag WHERE Type = 0 ORDER BY TagId ASC');
+    let dupCount = 0;
+    const affectedIds: number[] = [];
+
+    if (favTags.length > 1) {
+      dupCount += favTags.length - 1;
+      affectedIds.push(...favTags.slice(1).map((t) => t.TagId));
+    }
+
+    if (tableExists(db, 'TagMap') && favTags.length > 0) {
+      const canonicalId = favTags[0].TagId;
+      const dupLocs = queryAll<{ LocationId: number; c: number }>(
+        db,
+        'SELECT LocationId, COUNT(*) as c FROM TagMap WHERE TagId = :cid AND LocationId IS NOT NULL GROUP BY LocationId HAVING COUNT(*) > 1',
+        { ':cid': canonicalId }
+      );
+      for (const dl of dupLocs) {
+        dupCount += dl.c - 1;
+        affectedIds.push(dl.LocationId);
+      }
+    }
+
+    if (dupCount > 0) {
+      results.push({
+        key: 'dup_fav_tags',
+        label: 'Duplicate Favorites',
+        count: dupCount,
+        description: 'Multiple system favorite tags or duplicate publications pinned to home favorites.',
+        canFix: true,
+        affectedIds: Array.from(new Set(affectedIds)),
+      });
+    }
+  }
+
+  // 8. Duplicate Bookmarks & Out-of-bounds Slots (>= 10)
+  if (tableExists(db, 'Bookmark')) {
+    const hasPub = columnExists(db, 'Bookmark', 'PublicationLocationId');
+    const pubCol = hasPub ? 'PublicationLocationId' : 'LocationId';
+    const hasBt = columnExists(db, 'Bookmark', 'BlockType');
+    const hasBi = columnExists(db, 'Bookmark', 'BlockIdentifier');
+    const btCol = hasBt ? 'IFNULL(BlockType, 0)' : '0';
+    const biCol = hasBi ? 'IFNULL(BlockIdentifier, -1)' : '-1';
+
+    const dupBookmarksSql = `
+      SELECT b.BookmarkId
+      FROM Bookmark b
+      JOIN (
+        SELECT LocationId, ${pubCol} as pubId, ${btCol} as bt, ${biCol} as bi, MIN(BookmarkId) as keepId
+        FROM Bookmark
+        GROUP BY LocationId, ${pubCol}, ${btCol}, ${biCol}
+        HAVING COUNT(*) > 1
+      ) g ON b.LocationId = g.LocationId AND b.${pubCol} = g.pubId AND ${hasBt ? 'IFNULL(b.BlockType, 0)' : '0'} = g.bt AND ${hasBi ? 'IFNULL(b.BlockIdentifier, -1)' : '-1'} = g.bi
+      WHERE b.BookmarkId <> g.keepId
+    `;
+    const dupBookmarks = queryAll<{ BookmarkId: number }>(db, dupBookmarksSql);
+    const outOfBounds = queryAll<{ BookmarkId: number }>(db, 'SELECT BookmarkId FROM Bookmark WHERE Slot >= 10');
+    const allAffected = Array.from(new Set([...dupBookmarks.map((b) => b.BookmarkId), ...outOfBounds.map((b) => b.BookmarkId)]));
+
+    if (allAffected.length > 0) {
+      results.push({
+        key: 'dup_bookmarks',
+        label: 'Corrupted Bookmarks',
+        count: allAffected.length,
+        description: 'Duplicate study bookmarks or bookmark slots outside the valid range (0-9).',
+        canFix: true,
+        affectedIds: allAffected,
+      });
+    }
+  }
+
   return results;
 }
 
@@ -204,6 +276,117 @@ export function applyHealthFix(
     case 'unused_loc':
       execute(db, `DELETE FROM Location WHERE LocationId IN (${idList})`);
       return affectedIds.length;
+
+    case 'dup_fav_tags': {
+      if (tableExists(db, 'Tag')) {
+        const favTags = queryAll<{ TagId: number }>(db, 'SELECT TagId FROM Tag WHERE Type = 0 ORDER BY TagId ASC');
+        if (favTags.length > 0) {
+          const canonicalId = favTags[0].TagId;
+          const dupIds = favTags.slice(1).map((t) => t.TagId);
+          if (tableExists(db, 'TagMap')) {
+            for (const dupId of dupIds) {
+              const dupMaps = queryAll<{ TagMapId: number; LocationId: number }>(
+                db,
+                'SELECT TagMapId, LocationId FROM TagMap WHERE TagId = :did',
+                { ':did': dupId }
+              );
+              for (const tm of dupMaps) {
+                const exists = queryOne(
+                  db,
+                  'SELECT 1 FROM TagMap WHERE TagId = :cid AND LocationId = :lid LIMIT 1',
+                  { ':cid': canonicalId, ':lid': tm.LocationId }
+                );
+                if (!exists && tm.LocationId) {
+                  const nextPos = queryOne<{ nextPos: number }>(
+                    db,
+                    'SELECT COALESCE(MAX(Position), -1) + 1 AS nextPos FROM TagMap WHERE TagId = :cid',
+                    { ':cid': canonicalId }
+                  )?.nextPos ?? 0;
+                  execute(
+                    db,
+                    'UPDATE TagMap SET TagId = :cid, Position = :pos WHERE TagMapId = :tmid',
+                    { ':cid': canonicalId, ':pos': nextPos, ':tmid': tm.TagMapId }
+                  );
+                } else {
+                  execute(db, 'DELETE FROM TagMap WHERE TagMapId = :tmid', { ':tmid': tm.TagMapId });
+                }
+              }
+              execute(db, 'DELETE FROM Tag WHERE TagId = :did', { ':did': dupId });
+            }
+
+            // Deduplicate multiple entries for same LocationId under canonical tag
+            const canonicalMaps = queryAll<{ TagMapId: number; LocationId: number }>(
+              db,
+              'SELECT TagMapId, LocationId FROM TagMap WHERE TagId = :cid ORDER BY Position ASC, TagMapId ASC',
+              { ':cid': canonicalId }
+            );
+            const seenLocations = new Set<number>();
+            let curPos = 0;
+            for (const tm of canonicalMaps) {
+              if (seenLocations.has(tm.LocationId)) {
+                execute(db, 'DELETE FROM TagMap WHERE TagMapId = :tmid', { ':tmid': tm.TagMapId });
+              } else {
+                seenLocations.add(tm.LocationId);
+                execute(db, 'UPDATE TagMap SET Position = :pos WHERE TagMapId = :tmid', {
+                  ':pos': curPos++,
+                  ':tmid': tm.TagMapId,
+                });
+              }
+            }
+          }
+        }
+      }
+      return affectedIds.length;
+    }
+
+    case 'dup_bookmarks': {
+      if (tableExists(db, 'Bookmark')) {
+        const hasPub = columnExists(db, 'Bookmark', 'PublicationLocationId');
+        const pubCol = hasPub ? 'PublicationLocationId' : 'LocationId';
+        const hasBt = columnExists(db, 'Bookmark', 'BlockType');
+        const hasBi = columnExists(db, 'Bookmark', 'BlockIdentifier');
+        const btCol = hasBt ? 'IFNULL(BlockType, 0)' : '0';
+        const biCol = hasBi ? 'IFNULL(BlockIdentifier, -1)' : '-1';
+
+        const dupSql = `
+          SELECT b.BookmarkId FROM Bookmark b
+          JOIN (
+            SELECT LocationId, ${pubCol} as pubId, ${btCol} as bt, ${biCol} as bi, MIN(BookmarkId) as keepId
+            FROM Bookmark
+            GROUP BY LocationId, ${pubCol}, ${btCol}, ${biCol}
+            HAVING COUNT(*) > 1
+          ) g ON b.LocationId = g.LocationId AND b.${pubCol} = g.pubId AND ${hasBt ? 'IFNULL(b.BlockType, 0)' : '0'} = g.bt AND ${hasBi ? 'IFNULL(b.BlockIdentifier, -1)' : '-1'} = g.bi
+          WHERE b.BookmarkId <> g.keepId
+        `;
+        const dups = queryAll<{ BookmarkId: number }>(db, dupSql);
+        if (dups.length > 0) {
+          execute(db, `DELETE FROM Bookmark WHERE BookmarkId IN (${dups.map((d) => d.BookmarkId).join(',')})`);
+        }
+
+        const overSlots = queryAll<{ BookmarkId: number; pubId: number }>(
+          db,
+          `SELECT BookmarkId, ${pubCol} as pubId FROM Bookmark WHERE Slot >= 10`
+        );
+        for (const os of overSlots) {
+          const occupied = new Set(
+            queryAll<{ Slot: number }>(db, `SELECT Slot FROM Bookmark WHERE ${pubCol} = :pid`, { ':pid': os.pubId }).map((r) => r.Slot)
+          );
+          let freeSlot = -1;
+          for (let s = 0; s < 10; s++) {
+            if (!occupied.has(s)) {
+              freeSlot = s;
+              break;
+            }
+          }
+          if (freeSlot !== -1) {
+            execute(db, 'UPDATE Bookmark SET Slot = :slot WHERE BookmarkId = :bid', { ':slot': freeSlot, ':bid': os.BookmarkId });
+          } else {
+            execute(db, 'DELETE FROM Bookmark WHERE BookmarkId = :bid', { ':bid': os.BookmarkId });
+          }
+        }
+      }
+      return affectedIds.length;
+    }
 
     default:
       return 0;

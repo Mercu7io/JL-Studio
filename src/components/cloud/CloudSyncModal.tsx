@@ -243,7 +243,8 @@ export const CloudSyncModal: React.FC = () => {
   };
 
   const saveFileToDisk = (file: File) => {
-    const url = URL.createObjectURL(file);
+    const blob = file.type === 'application/octet-stream' ? file : new Blob([file], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = file.name;
